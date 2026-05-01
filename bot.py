@@ -16,9 +16,6 @@ YOOKASSA_TOKEN = os.getenv("YOOKASSA_TOKEN")
 REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "20"))
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
-
 bot = telebot.TeleBot(TOKEN)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "habits.db")
