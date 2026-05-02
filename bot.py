@@ -16,6 +16,9 @@ YOOKASSA_TOKEN = os.getenv("YOOKASSA_TOKEN")
 REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "20"))
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
+
 bot = telebot.TeleBot(TOKEN)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "habits.db")
@@ -107,7 +110,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 premium_until TEXT,
-                created_at TEXT
+                created_at TEXT,
+                username TEXT,
+                first_name TEXT
             )
         """)
         conn.execute("""
@@ -121,20 +126,30 @@ def init_db():
                 UNIQUE(user_id, name)
             )
         """)
-        # Миграция: добавить created_at если её нет
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
-        except Exception:
-            pass
+        # Миграции
+        for col, definition in [
+            ("created_at", "TEXT"),
+            ("username", "TEXT"),
+            ("first_name", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
         conn.commit()
 
 
-def ensure_user(user_id: int):
+def ensure_user(user_id: int, username: str | None = None, first_name: str | None = None):
     with get_conn() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, premium_until, created_at) VALUES (?, NULL, ?)",
-            (user_id, datetime.now().isoformat())
+            "INSERT OR IGNORE INTO users (user_id, premium_until, created_at, username, first_name) VALUES (?, NULL, ?, ?, ?)",
+            (user_id, datetime.now().isoformat(), username, first_name)
         )
+        if username is not None or first_name is not None:
+            conn.execute(
+                "UPDATE users SET username = COALESCE(?, username), first_name = COALESCE(?, first_name) WHERE user_id = ?",
+                (username, first_name, user_id)
+            )
         conn.commit()
 
 
@@ -149,6 +164,38 @@ def is_premium(user_id: int) -> bool:
             except ValueError:
                 return False
     return False
+
+
+def revoke_premium(user_id: int):
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET premium_until = NULL WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+USERS_PAGE_SIZE = 8
+
+
+def get_all_users_detail(offset: int = 0) -> list:
+    now_iso = datetime.now().isoformat()
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT u.user_id, u.username, u.first_name, u.created_at, u.premium_until,
+                   COUNT(h.id) as habit_count,
+                   CASE WHEN u.premium_until > ? THEN 1 ELSE 0 END as is_premium
+            FROM users u
+            LEFT JOIN habits h ON h.user_id = u.user_id
+            GROUP BY u.user_id
+            ORDER BY u.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (now_iso, USERS_PAGE_SIZE, offset)
+        ).fetchall()
+
+
+def count_all_users() -> int:
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
 
 def add_premium(user_id: int, days: int = 30):
@@ -363,6 +410,52 @@ def stats_inline(habits, today: str) -> types.InlineKeyboardMarkup:
     return markup
 
 
+def admin_main_inline() -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("👥 Список пользователей", callback_data="adm_users:0"))
+    return markup
+
+
+def admin_users_inline(users: list, page: int, total: int) -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for u in users:
+        uid = u["user_id"]
+        name = u["first_name"] or ""
+        uname = f"@{u['username']}" if u["username"] else f"id:{uid}"
+        prem = "⭐" if u["is_premium"] else "🆓"
+        habits = u["habit_count"]
+        markup.add(types.InlineKeyboardButton(
+            f"{prem} {name} {uname} · {habits} привычек",
+            callback_data=f"adm_user:{uid}:{page}"
+        ))
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton("◀️ Назад", callback_data=f"adm_users:{page - 1}"))
+    total_pages = (total - 1) // USERS_PAGE_SIZE
+    if page < total_pages:
+        nav.append(types.InlineKeyboardButton("Вперёд ▶️", callback_data=f"adm_users:{page + 1}"))
+    if nav:
+        markup.row(*nav)
+    markup.add(types.InlineKeyboardButton("🏠 В статистику", callback_data="adm_back"))
+    return markup
+
+
+def admin_user_inline(uid: int, is_prem: bool, page: int) -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if is_prem:
+        markup.add(
+            types.InlineKeyboardButton("⭐ +30 дней", callback_data=f"adm_prem:{uid}:30:{page}"),
+            types.InlineKeyboardButton("❌ Убрать Premium", callback_data=f"adm_revoke:{uid}:{page}"),
+        )
+    else:
+        markup.add(
+            types.InlineKeyboardButton("⭐ +30 дней", callback_data=f"adm_prem:{uid}:30:{page}"),
+            types.InlineKeyboardButton("⭐ +365 дней", callback_data=f"adm_prem:{uid}:365:{page}"),
+        )
+    markup.add(types.InlineKeyboardButton("◀️ К списку", callback_data=f"adm_users:{page}"))
+    return markup
+
+
 def confirm_delete_inline(habit_id: int, name: str) -> types.InlineKeyboardMarkup:
     """Подтверждение удаления привычки."""
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -426,7 +519,7 @@ def build_stats_text(user_id: int) -> str:
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
-    ensure_user(message.from_user.id)
+    ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     user_states.pop(message.from_user.id, None)
     name = message.from_user.first_name or "друг"
     text = (
@@ -495,7 +588,7 @@ def _show_stats(chat_id: int, user_id: int, edit_message_id: int | None = None):
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить привычку")
 def menu_add(message):
     user_id = message.from_user.id
-    ensure_user(user_id)
+    ensure_user(user_id, message.from_user.username, message.from_user.first_name)
 
     if not is_premium(user_id) and count_habits(user_id) >= FREE_LIMIT:
         text = (
@@ -834,7 +927,195 @@ def cmd_admin(message):
         f"📅 <b>По частоте:</b>\n{freq_lines}\n\n"
         f"🔥 <b>Топ стрики:</b>\n{streak_lines}"
     )
-    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=main_keyboard())
+    bot.send_message(message.chat.id, text, parse_mode="HTML",
+                     reply_markup=admin_main_inline())
+
+
+def _admin_stats_text() -> str:
+    s = get_admin_stats()
+    top_h = "\n".join(
+        f"  {i+1}. {r['name']} — {r['cnt']} польз."
+        for i, r in enumerate(s["top_habits"])
+    ) or "  —"
+    freq_lines = "\n".join(
+        f"  • {FREQUENCY_OPTIONS.get(r['frequency'], {}).get('short', r['frequency'])}: {r['cnt']}"
+        for r in s["freq_dist"]
+    ) or "  —"
+    streak_lines = "\n".join(
+        f"  {i+1}. {r['name']} — {r['streak']} дн. (id:{r['user_id']})"
+        for i, r in enumerate(s["top_streaks"])
+    ) or "  —"
+    return (
+        f"📊 <b>Админ-панель — {date.today().strftime('%d.%m.%Y')}</b>\n"
+        f"{'─' * 30}\n\n"
+        f"👥 <b>Пользователи</b>\n"
+        f"  Всего: <b>{s['total_users']}</b>\n"
+        f"  Новых за 7 дней: <b>{s['new_users_week']}</b>\n"
+        f"  Активны сегодня: <b>{s['active_today']}</b>\n"
+        f"  ⭐ Premium: <b>{s['premium_users']}</b>\n\n"
+        f"📌 <b>Привычки</b>\n"
+        f"  Всего создано: <b>{s['total_habits']}</b>\n\n"
+        f"🏆 <b>Топ-5 названий:</b>\n{top_h}\n\n"
+        f"📅 <b>По частоте:</b>\n{freq_lines}\n\n"
+        f"🔥 <b>Топ стрики:</b>\n{streak_lines}"
+    )
+
+
+# ─────────────────────── HANDLERS: АДМИН — УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ───────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_back")
+def adm_back(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔ Нет доступа.")
+        return
+    bot.answer_callback_query(call.id)
+    try:
+        bot.edit_message_text(_admin_stats_text(), call.message.chat.id,
+                              call.message.message_id, parse_mode="HTML",
+                              reply_markup=admin_main_inline())
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_users:"))
+def adm_users(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔ Нет доступа.")
+        return
+    bot.answer_callback_query(call.id)
+    page = int(call.data.split(":")[1])
+    offset = page * USERS_PAGE_SIZE
+    users = get_all_users_detail(offset)
+    total = count_all_users()
+    total_pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+    text = (
+        f"👥 <b>Пользователи</b> (стр. {page + 1}/{total_pages}, всего {total})\n\n"
+        "Нажми на пользователя, чтобы управлять Premium."
+    )
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode="HTML",
+                              reply_markup=admin_users_inline(users, page, total))
+    except Exception:
+        bot.send_message(call.message.chat.id, text, parse_mode="HTML",
+                         reply_markup=admin_users_inline(users, page, total))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_user:"))
+def adm_user_detail(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔ Нет доступа.")
+        return
+    bot.answer_callback_query(call.id)
+    parts = call.data.split(":")
+    uid = int(parts[1])
+    page = int(parts[2])
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id, username, first_name, premium_until, created_at FROM users WHERE user_id = ?",
+            (uid,)
+        ).fetchone()
+    if not row:
+        bot.answer_callback_query(call.id, "Пользователь не найден.")
+        return
+
+    habits_count = count_habits(uid)
+    prem = is_premium(uid)
+    prem_until = "—"
+    if row["premium_until"]:
+        try:
+            prem_until = datetime.fromisoformat(row["premium_until"]).strftime("%d.%m.%Y")
+        except ValueError:
+            pass
+    name_str = row["first_name"] or "—"
+    uname_str = f"@{row['username']}" if row["username"] else "—"
+    created = "—"
+    if row["created_at"]:
+        try:
+            created = datetime.fromisoformat(row["created_at"]).strftime("%d.%m.%Y")
+        except ValueError:
+            pass
+
+    text = (
+        f"👤 <b>Пользователь</b>\n"
+        f"{'─' * 25}\n"
+        f"ID: <code>{uid}</code>\n"
+        f"Имя: {name_str}\n"
+        f"Username: {uname_str}\n"
+        f"Зарегистрирован: {created}\n"
+        f"Привычек: <b>{habits_count}</b>\n"
+        f"Premium: {'⭐ активен до ' + prem_until if prem else '🆓 нет'}\n"
+    )
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode="HTML",
+                              reply_markup=admin_user_inline(uid, prem, page))
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_prem:"))
+def adm_grant_premium(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔ Нет доступа.")
+        return
+    parts = call.data.split(":")
+    uid = int(parts[1])
+    days = int(parts[2])
+    page = int(parts[3])
+    new_until = add_premium(uid, days)
+    bot.answer_callback_query(call.id, f"✅ Premium выдан до {new_until.strftime('%d.%m.%Y')}!", show_alert=True)
+    # Обновить карточку пользователя
+    fake = type("obj", (object,), {"data": f"adm_user:{uid}:{page}", "from_user": call.from_user,
+                                   "message": call.message, "id": call.id})()
+    adm_user_detail(fake)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_revoke:"))
+def adm_revoke_premium(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔ Нет доступа.")
+        return
+    parts = call.data.split(":")
+    uid = int(parts[1])
+    page = int(parts[2])
+    revoke_premium(uid)
+    bot.answer_callback_query(call.id, "❌ Premium отозван.", show_alert=True)
+    fake = type("obj", (object,), {"data": f"adm_user:{uid}:{page}", "from_user": call.from_user,
+                                   "message": call.message, "id": call.id})()
+    adm_user_detail(fake)
+
+
+@bot.message_handler(commands=["addpremium"])
+def cmd_addpremium(message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        bot.send_message(message.chat.id, "⛔ Нет доступа.", reply_markup=main_keyboard())
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id,
+                         "Использование: /addpremium <user_id> [дней]\nПример: /addpremium 123456789 30",
+                         reply_markup=main_keyboard())
+        return
+    try:
+        uid = int(parts[1])
+        days = int(parts[2]) if len(parts) >= 3 else 30
+    except ValueError:
+        bot.send_message(message.chat.id, "⚠️ Неверный формат. Пример: /addpremium 123456789 30",
+                         reply_markup=main_keyboard())
+        return
+    with get_conn() as conn:
+        exists = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,)).fetchone()
+    if not exists:
+        bot.send_message(message.chat.id, f"⚠️ Пользователь <code>{uid}</code> не найден в базе.",
+                         parse_mode="HTML", reply_markup=main_keyboard())
+        return
+    new_until = add_premium(uid, days)
+    bot.send_message(message.chat.id,
+                     f"✅ Premium выдан пользователю <code>{uid}</code>\n"
+                     f"⭐ Активен до: <b>{new_until.strftime('%d.%m.%Y')}</b>",
+                     parse_mode="HTML", reply_markup=main_keyboard())
 
 
 # ─────────────────────── НАПОМИНАНИЯ ───────────────────────
